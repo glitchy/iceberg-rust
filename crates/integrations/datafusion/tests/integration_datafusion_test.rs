@@ -943,3 +943,113 @@ async fn test_insert_into_partitioned() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_insert_overwrite() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_overwrite".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Step 1: Insert initial data
+    let df = ctx
+        .sql("INSERT INTO catalog.test_insert_overwrite.my_table VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let rows_inserted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_inserted.value(0), 2);
+
+    // Step 2: Verify initial data is present
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite.my_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              1,
+              2,
+            ],
+            foo2: StringArray
+            [
+              "alice",
+              "bob",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    // Step 3: Overwrite with new data
+    let df = ctx
+        .sql(
+            "INSERT OVERWRITE catalog.test_insert_overwrite.my_table VALUES (10, 'charlie'), (20, 'diana'), (30, 'eve')",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let rows_inserted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_inserted.value(0), 3);
+
+    // Step 4: Verify only the new data is present (old data replaced)
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite.my_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              10,
+              20,
+              30,
+            ],
+            foo2: StringArray
+            [
+              "charlie",
+              "diana",
+              "eve",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    // Step 5: Verify the snapshot is recorded as an overwrite operation
+    let table_ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let table = client.load_table(&table_ident).await?;
+    let current_snapshot = table.metadata().current_snapshot().unwrap();
+    assert_eq!(
+        current_snapshot.summary().operation,
+        iceberg::spec::Operation::Overwrite,
+        "The latest snapshot should be an overwrite operation"
+    );
+
+    Ok(())
+}

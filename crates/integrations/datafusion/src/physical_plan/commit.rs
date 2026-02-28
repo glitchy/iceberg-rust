@@ -25,6 +25,7 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -38,14 +39,16 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::to_datafusion_error;
 
-/// IcebergCommitExec is responsible for collecting the files written and use
-/// [`Transaction::fast_append`] to commit the data files written.
+/// IcebergCommitExec is responsible for collecting the files written and
+/// committing them to the table via the appropriate transaction action
+/// (`fast_append` for `INSERT INTO`, `overwrite` for `INSERT OVERWRITE`).
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
     catalog: Arc<dyn Catalog>,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
+    insert_op: InsertOp,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
 }
@@ -56,6 +59,7 @@ impl IcebergCommitExec {
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
+        insert_op: InsertOp,
     ) -> Self {
         let count_schema = Self::make_count_schema();
 
@@ -66,6 +70,7 @@ impl IcebergCommitExec {
             catalog,
             input,
             schema,
+            insert_op,
             count_schema,
             plan_properties,
         }
@@ -165,6 +170,7 @@ impl ExecutionPlan for IcebergCommitExec {
             self.catalog.clone(),
             children[0].clone(),
             self.schema.clone(),
+            self.insert_op,
         )))
     }
 
@@ -190,6 +196,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let current_schema = self.table.metadata().current_schema().clone();
 
         let catalog = Arc::clone(&self.catalog);
+        let insert_op = self.insert_op;
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -245,14 +252,34 @@ impl ExecutionPlan for IcebergCommitExec {
                 return Ok(RecordBatch::new_empty(count_schema));
             }
 
-            // Create a transaction and commit the data files
+            // Create a transaction and commit the data files using the appropriate action
             let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
+            let tx = match insert_op {
+                InsertOp::Append => tx
+                    .fast_append()
+                    .add_data_files(data_files)
+                    .apply(tx)
+                    .map_err(to_datafusion_error)?,
+                InsertOp::Overwrite => {
+                    // Collect all existing live data files to delete them
+                    let existing_files =
+                        collect_existing_data_files(&table).await.map_err(to_datafusion_error)?;
 
-            // Apply the action and commit the transaction
-            let _updated_table = action
-                .apply(tx)
-                .map_err(to_datafusion_error)?
+                    tx.overwrite()
+                        .add_data_files(data_files)
+                        .delete_data_files(existing_files)
+                        .apply(tx)
+                        .map_err(to_datafusion_error)?
+                }
+                InsertOp::Replace => {
+                    return Err(to_datafusion_error(iceberg::Error::new(
+                        iceberg::ErrorKind::FeatureUnsupported,
+                        "INSERT REPLACE is not supported for Iceberg tables",
+                    )));
+                }
+            };
+
+            let _updated_table = tx
                 .commit(catalog.as_ref())
                 .await
                 .map_err(to_datafusion_error)?;
@@ -266,6 +293,35 @@ impl ExecutionPlan for IcebergCommitExec {
             stream,
         )))
     }
+}
+
+/// Collect all live data files from the table's current snapshot.
+///
+/// Used by `INSERT OVERWRITE` to enumerate files that need to be deleted
+/// before the new data is added.
+async fn collect_existing_data_files(table: &Table) -> iceberg::Result<Vec<DataFile>> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(vec![]);
+    };
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await?;
+
+    let mut existing_files = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+            continue;
+        }
+        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries() {
+            if entry.is_alive() {
+                existing_files.push(entry.data_file().clone());
+            }
+        }
+    }
+
+    Ok(existing_files)
 }
 
 #[cfg(test)]
@@ -470,8 +526,13 @@ mod tests {
             false,
         )]));
 
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            catalog.clone(),
+            input_exec,
+            arrow_schema,
+            InsertOp::Append,
+        );
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());

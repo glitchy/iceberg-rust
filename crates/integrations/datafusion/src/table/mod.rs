@@ -159,7 +159,7 @@ impl TableProvider for IcebergTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Load fresh table metadata from catalog
         let table = self
@@ -231,6 +231,7 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             coalesce_partitions,
             self.schema.clone(),
+            insert_op,
         )))
     }
 }
