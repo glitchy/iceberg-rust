@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::expr::Predicate;
 use crate::spec::{
     DataFile, FormatVersion, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
     ManifestWriterBuilder, Operation,
@@ -30,6 +31,7 @@ use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
+use crate::transaction::validate::validate_no_conflicting_data;
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// OverwriteAction is a transaction action for overwriting data files in the table.
@@ -44,10 +46,13 @@ pub struct OverwriteAction {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
+    validate_added_files: bool,
+    conflict_detection_filter: Option<Predicate>,
+    from_snapshot_id: Option<i64>,
 }
 
 impl OverwriteAction {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(from_snapshot_id: Option<i64>) -> Self {
         Self {
             check_duplicate: true,
             commit_uuid: None,
@@ -55,12 +60,52 @@ impl OverwriteAction {
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             deleted_data_files: vec![],
+            validate_added_files: false,
+            conflict_detection_filter: None,
+            from_snapshot_id,
         }
     }
 
     /// Set whether to check duplicate files.
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
+        self
+    }
+
+    /// Enable validation that no concurrently-added data file conflicts with this overwrite.
+    ///
+    /// When enabled, the commit is rejected if any snapshot committed after this action's starting
+    /// snapshot added a data file that could contain records matching the
+    /// [conflict detection filter](Self::conflict_detection_filter). Validation is re-run against
+    /// the latest table state on every commit retry.
+    ///
+    /// This guards against concurrent *appends* only. It does not yet detect concurrent delete
+    /// files or concurrent removal of the files being replaced, so it is not sufficient for full
+    /// serializable isolation on tables that use delete files.
+    pub fn validate_no_conflicting_data(mut self) -> Self {
+        self.validate_added_files = true;
+        self
+    }
+
+    /// Set the filter used to scope [conflict detection](Self::validate_no_conflicting_data).
+    ///
+    /// Only concurrently-added data files that could contain records matching `predicate` are
+    /// treated as conflicts. When unset, conflict detection scans every concurrently-added file
+    /// (equivalent to `TRUE`).
+    ///
+    /// The filter only scopes validation; it is not tied to the files added or deleted by this
+    /// action. Callers must set it to match the overwrite's effective predicate — a filter that
+    /// does not cover what was overwritten will silently weaken the guarantee.
+    pub fn conflict_detection_filter(mut self, predicate: Predicate) -> Self {
+        self.conflict_detection_filter = Some(predicate);
+        self
+    }
+
+    /// Override the snapshot that [conflict detection](Self::validate_no_conflicting_data) reads
+    /// from. Conflicts are detected among snapshots committed after this one. Defaults to the
+    /// table's current snapshot when the action was created.
+    pub fn validate_from_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.from_snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -111,6 +156,14 @@ impl TransactionAction for OverwriteAction {
 
         if self.check_duplicate {
             snapshot_producer.validate_duplicate_files().await?;
+        }
+
+        if self.validate_added_files {
+            let conflict_filter = self
+                .conflict_detection_filter
+                .clone()
+                .unwrap_or(Predicate::AlwaysTrue);
+            validate_no_conflicting_data(table, self.from_snapshot_id, &conflict_filter).await?;
         }
 
         let deleted_file_paths: HashSet<String> = self
@@ -258,13 +311,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::catalog::Catalog;
+    use crate::expr::{Predicate, Reference};
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, MAIN_BRANCH,
         ManifestStatus, Operation, SnapshotRef, Struct,
     };
-    use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
-    use crate::{TableRequirement, TableUpdate};
+    use crate::table::Table;
+    use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table_in_catalog};
+    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
+    use crate::{ErrorKind, TableRequirement, TableUpdate};
 
     fn test_data_file(path: &str, partition_spec_id: i32) -> DataFile {
         DataFileBuilder::default()
@@ -275,6 +332,22 @@ mod tests {
             .record_count(1)
             .partition_spec_id(partition_spec_id)
             .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    // Like `test_data_file` but with `y` (field id 2, a non-partition column) bounds set to [y, y].
+    fn test_data_file_with_y_bounds(path: &str, partition_spec_id: i32, y: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(partition_spec_id)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .lower_bounds(HashMap::from([(2, Datum::long(y))]))
+            .upper_bounds(HashMap::from([(2, Datum::long(y))]))
             .build()
             .unwrap()
     }
@@ -412,10 +485,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_overwrite_with_deleted_files() {
-        use crate::memory::tests::new_memory_catalog;
-        use crate::transaction::ApplyTransactionAction;
-        use crate::transaction::tests::make_v3_minimal_table_in_catalog;
-
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let spec_id = table.metadata().default_partition_spec_id();
@@ -524,5 +593,115 @@ mod tests {
                 "Deleted entry should survive fast_append, entries: {all_entries:?}",
             );
         }
+    }
+
+    async fn append(catalog: &impl Catalog, table: &Table, path: &str) -> Table {
+        let spec_id = table.metadata().default_partition_spec_id();
+        let tx = Transaction::new(table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![test_data_file(path, spec_id)]);
+        action.apply(tx).unwrap().commit(catalog).await.unwrap()
+    }
+
+    // Builds a writer overwrite reading from `base`, then lands a concurrent append on top.
+    async fn writer_and_concurrent_append(
+        catalog: &impl Catalog,
+        base: &Table,
+        filter: Option<Predicate>,
+    ) -> Transaction {
+        let spec_id = base.metadata().default_partition_spec_id();
+        let tx = Transaction::new(base);
+        let mut action = tx
+            .overwrite()
+            .add_data_files(vec![test_data_file("test/replacement.parquet", spec_id)])
+            .validate_no_conflicting_data();
+        if let Some(filter) = filter {
+            action = action.conflict_detection_filter(filter);
+        }
+        let writer_tx = action.apply(tx).unwrap();
+
+        append(catalog, base, "test/concurrent.parquet").await;
+        writer_tx
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_validate_detects_concurrent_append() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let base = append(&catalog, &table, "test/a.parquet").await;
+
+        let writer = writer_and_concurrent_append(&catalog, &base, None).await;
+        let err = writer.commit(&catalog).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_validate_filter_excludes_concurrent_append() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let base = append(&catalog, &table, "test/a.parquet").await;
+
+        // Concurrent files live in partition x=300; a filter on x=999 prunes them.
+        let filter = Reference::new("x").equal_to(Datum::long(999));
+        let writer = writer_and_concurrent_append(&catalog, &base, Some(filter)).await;
+        assert!(writer.commit(&catalog).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_validate_metrics_excludes_concurrent_append() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let base = append(&catalog, &table, "test/a.parquet").await;
+        let spec_id = base.metadata().default_partition_spec_id();
+
+        // Filter on `y`, a non-partition column, so the manifest passes partition-summary pruning
+        // and the per-file metrics evaluator is what must exclude the concurrent file.
+        let tx = Transaction::new(&base);
+        let action = tx
+            .overwrite()
+            .add_data_files(vec![test_data_file("test/replacement.parquet", spec_id)])
+            .validate_no_conflicting_data()
+            .conflict_detection_filter(Reference::new("y").equal_to(Datum::long(999)));
+        let writer_tx = action.apply(tx).unwrap();
+
+        // Concurrent file's y bounds are [5, 5] — outside y = 999, so metrics must exclude it.
+        let tx2 = Transaction::new(&base);
+        let action = tx2
+            .fast_append()
+            .add_data_files(vec![test_data_file_with_y_bounds(
+                "test/concurrent.parquet",
+                spec_id,
+                5,
+            )]);
+        action.apply(tx2).unwrap().commit(&catalog).await.unwrap();
+
+        assert!(writer_tx.commit(&catalog).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_validate_from_snapshot_id_widens_window() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let snap_a = append(&catalog, &table, "test/a.parquet").await;
+        let a_id = snap_a.metadata().current_snapshot_id().unwrap();
+        let snap_b = append(&catalog, &snap_a, "test/b.parquet").await;
+        let spec_id = snap_b.metadata().default_partition_spec_id();
+
+        // Reading from B the default window is empty; overriding the start back to A pulls B's
+        // added file into the window. If the override were ignored, the commit would succeed.
+        let tx = Transaction::new(&snap_b);
+        let action = tx
+            .overwrite()
+            .add_data_files(vec![test_data_file("test/replacement.parquet", spec_id)])
+            .validate_no_conflicting_data()
+            .validate_from_snapshot_id(a_id);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
 }

@@ -63,6 +63,7 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
+mod validate;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,8 +155,11 @@ impl Transaction {
     }
 
     /// Creates an overwrite action.
+    ///
+    /// The action captures the table's current snapshot as the starting point for optional
+    /// conflict detection (see [`OverwriteAction::validate_no_conflicting_data`]).
     pub fn overwrite(&self) -> OverwriteAction {
-        OverwriteAction::new()
+        OverwriteAction::new(self.table.metadata().current_snapshot_id())
     }
 
     /// Creates replace sort order action.
